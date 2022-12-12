@@ -78,7 +78,7 @@ def eval_erl(skeleton_file, segmentation_file, segmentation_ds):
 
 class XPRESS:
     def __init__(self):
-        self.input_file = os.path.join(DEFAULT_INPUT_PATH, "test_unet_vxel_skel_300_frag06_expanded.h5")
+        self.input_file = os.path.join(DEFAULT_INPUT_PATH, "test_pred.h5")
         self.output_file = DEFAULT_EVALUATION_OUTPUT_FILE_PATH
         self.gt_file = os.path.join(DEFAULT_GROUND_TRUTH_PATH, "100nm_Cutout6_Testing_1025.npz")
         self.segmentation_ds = 'submission'
