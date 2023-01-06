@@ -10,8 +10,8 @@ docker volume create xpress-output-$VOLUME_SUFFIX
 
 # Do not change any of the parameters to docker run, these are fixed
 docker run --rm \
-        --memory="16g" \
-        --memory-swap="16g" \
+        --memory="4g" \
+        --memory-swap="4g" \
         --network="none" \
         --cap-drop="ALL" \
         --security-opt="no-new-privileges" \
