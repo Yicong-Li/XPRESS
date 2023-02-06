@@ -7,6 +7,7 @@ import networkx as nx
 import numpy as np
 import argparse
 from itertools import combinations, product
+from collections import defaultdict
 from evalutils.evalutils import (
     DEFAULT_INPUT_PATH,
     DEFAULT_EVALUATION_OUTPUT_FILE_PATH,
@@ -56,12 +57,22 @@ def eval_erl(graph):
     node_seg_lut = {}
     for node, attr in graph.nodes(data=True):
         node_seg_lut[node] = attr['seg_label']
+    
+    # get total skel length
+    skeleton_lengths = funlib.evaluate.run_length.get_skeleton_lengths(
+        skeletons=graph,
+        skeleton_position_attributes=['zyx_coord'],
+        skeleton_id_attribute='skeleton_id')
+    skeleton_lengths = [l for _, l in skeleton_lengths.items() if l > 0]
+    average_skel_length = np.mean(skeleton_lengths)
 
-    res = funlib.evaluate.expected_run_length(
+    erl = funlib.evaluate.expected_run_length(
         skeletons=graph, skeleton_id_attribute='skeleton_id',
         node_segment_lut=node_seg_lut, skeleton_position_attributes=['zyx_coord'],
         return_merge_split_stats=False, edge_length_attribute='edge_length')
-    return res
+    erl_norm = erl/average_skel_length
+
+    return erl, erl_norm
 
 def build_segment_label_subgraph(segment_nodes, graph):
     subgraph = graph.subgraph(segment_nodes)
@@ -134,10 +145,11 @@ def get_split_merges(graph):
 
 
 def set_point_in_array(array, point_coord, val):
-        point_coord = daisy.Coordinate(point_coord)
-        vox_aligned_offset = (point_coord // array.voxel_size) * array.voxel_size
-        point_roi = daisy.Roi(vox_aligned_offset, array.voxel_size)
-        array[point_roi] = val
+    '''Helper function to set value using real-world nm coordinates'''
+    point_coord = daisy.Coordinate(point_coord)
+    vox_aligned_offset = (point_coord // array.voxel_size) * array.voxel_size
+    point_roi = daisy.Roi(vox_aligned_offset, array.voxel_size)
+    array[point_roi] = val
 
 
 def make_voxel_gt_array(test_array, gt_graph):
@@ -152,11 +164,12 @@ def make_voxel_gt_array(test_array, gt_graph):
 
 
 def get_voi(segment_array, gt_graph):
+    '''Wrapper fn to compute Rand/VOI scores'''
     voxel_gt = make_voxel_gt_array(segment_array, gt_graph)
     res = funlib.evaluate.rand_voi(truth=voxel_gt.data, test=segment_array.data)
     return res
 
-def run_eval(skeleton_file, segmentation_file, segmentation_ds, roi):
+def run_eval(skeleton_file, segmentation_file, segmentation_ds, roi, downsampling=None):
     
     # load segmentation
     segment_array = daisy.open_ds(segmentation_file, segmentation_ds)
@@ -166,10 +179,10 @@ def run_eval(skeleton_file, segmentation_file, segmentation_ds, roi):
         raise RuntimeError(f"Provided segmentation does not contain test ROI ({roi})")
     segment_array = segment_array[roi]
 
-    # downsample if necessary
-    if segment_array.data.shape == (1072, 1072, 1072):
-        ndarray = segment_array.data[::3, ::3, ::3]
-        ds_voxel_size = segment_array.voxel_size * 3
+    if downsampling is not None:
+        assert type(downsampling) == int
+        ndarray = segment_array.data[::downsampling, ::downsampling, ::downsampling]
+        ds_voxel_size = segment_array.voxel_size * downsampling
         # align ROI
         roi_begin = (segment_array.roi.begin // ds_voxel_size) * ds_voxel_size
         roi_shape = daisy.Coordinate(ndarray.shape) * ds_voxel_size
@@ -189,7 +202,7 @@ def run_eval(skeleton_file, segmentation_file, segmentation_ds, roi):
     ret['gt_graph'] = gt_graph
 
     # Compute ERL
-    ret['erl'] = eval_erl(gt_graph)
+    ret['erl'], ret['erl_norm'] = eval_erl(gt_graph)
 
     # Compute merge-split
     split_edges, merged_edges = get_split_merges(gt_graph)
@@ -199,57 +212,117 @@ def run_eval(skeleton_file, segmentation_file, segmentation_ds, roi):
     # Compute Rand/VOI
     ret['rand_voi'] = get_voi(segment_array, gt_graph)
 
+    # Compute xpress score
+    # xpress score is 50% normed erl and 50% normed voi
+    rand_voi = ret['rand_voi']
+    ret['xpress_voi'] = 1-0.5*(rand_voi['nvi_split']+rand_voi['nvi_merge'])
+    ret['xpress_rand'] = 0.5*(rand_voi['rand_split']+rand_voi['rand_merge'])
+    ret['xpress_erl_voi'] = 0.5*ret['xpress_voi'] + 0.5*ret['erl_norm']
+    ret['xpress_erl_rand'] = 0.5*ret['xpress_rand'] + 0.5*ret['erl_norm']
+
     return ret
+
+def check_submission_correctness(segmentation_file,
+                                 check_ds_name='submission',
+                                 check_resolution=(99,99,99),
+                                 check_roi=daisy.Roi((3267,3267,3267), (33066,33066,33066)),
+                                 ):
+    try:
+        segment_array = daisy.open_ds(segmentation_file, check_ds_name)
+    except:
+        raise RuntimeError(f'Fail: cannot open {segmentation_file} with dataset {check_ds_name}')
+    assert segment_array.voxel_size == check_resolution, f"Fail: voxel_size is not {check_resolution}"
+    assert segment_array.roi == check_roi, f"Fail: roi is not {check_roi}"
 
 class XPRESS:
     def __init__(self):
-        self.skeleton_file = os.path.join(DEFAULT_GROUND_TRUTH_PATH, '100nm_Cutout4_Validation.npz')
-        self.segmentation_file = os.path.join(DEFAULT_INPUT_PATH, 'prediction.h5')
-        self.segmentation_ds = 'submission_0p500'
-        self.roi_begin = '13266,13266,13266'
-        self.roi_shape = '13167,13167,13167'
+        self.skeleton_file = os.path.join(DEFAULT_GROUND_TRUTH_PATH, 'XPRESS_test_skels.npz')
+        self.segmentation_file = os.path.join(DEFAULT_INPUT_PATH, 'submission.h5')
+        self.segmentation_ds = 'submission'
+        self.downsampling = None
+        self.print_errors = 0
+        self.pring_in_xyz = 0
+        self.check_submission = 0
+        self.show_all_scores = 1
+        self.mode = 'test'
         self.output_file = DEFAULT_EVALUATION_OUTPUT_FILE_PATH
 
     def evaluate(self):
-        roi_begin = [float(k) for k in self.roi_begin.split(',')]
-        roi_shape = [float(k) for k in self.roi_shape.split(',')]
-        roi = daisy.Roi(roi_begin, roi_shape)
-        # roi = daisy.Roi((3366,3366,3366), (32967,32967,32967))
-        # roi = daisy.Roi((3465,3465,3465), (28017,28017,28017))
-        # roi = None
+        if self.check_submission:
+            check_submission_correctness(self.segmentation_file)
+            print('Pass')
+            exit()
+        
+        if self.mode == "validation":
+            roi_begin = '8316,8316,8316'
+            roi_shape = '23067,23067,23067'
+        elif self.mode == "test":
+            roi_begin = '3267,3267,3267'
+            roi_shape = '33066,33066,33066'
+        
+        assert self.skeleton_file is not None, "Error: skeleton_file is not given"
 
-        res = run_eval(self.skeleton_file, self.segmentation_file, self.segmentation_ds, roi)
+        # Parse ROI
+        roi = None
+        if roi_begin is not None or roi_begin is not None:
+            roi_begin = [float(k) for k in roi_begin.split(',')]
+            roi_shape = [float(k) for k in roi_shape.split(',')]
+            roi = daisy.Roi(roi_begin, roi_shape)
+
+        res = run_eval(self.skeleton_file, self.segmentation_file, self.segmentation_ds, roi, self.downsampling)
+
+        if not self.show_all_scores:
+            # Print just the single xpress score
+            print(f"{res['xpress_erl_rand']}")
+            exit()
 
         split_edges = res['split_edges']
         merged_edges = res['merged_edges']
 
-        print_coordinates = True
-        print_coordinates = False
-        if print_coordinates:
+        if self.print_errors:
             gt_graph = res['gt_graph']
-            print("Split errors:")
-            for node1, node2 in split_edges:
+            def print_coords(node1, node2):
                 node1_coord = daisy.Coordinate(gt_graph.nodes[node1]['zyx_coord']) / 33
                 node2_coord = daisy.Coordinate(gt_graph.nodes[node2]['zyx_coord']) / 33
+                if self.print_in_xyz:
+                    node1_coord = node1_coord[::-1]
+                    node2_coord = node2_coord[::-1]
                 print(f"{node1_coord} to {node2_coord}")
+
+            print("Split errors:")
+            splits_by_skel = defaultdict(list)
+            for edge in split_edges:
+                splits_by_skel[gt_graph.nodes[edge[0]]['skeleton_id']].append(edge)
+            for skel in splits_by_skel:
+                print(f'Skeleton #{skel}')
+                for edge in splits_by_skel[skel]:
+                    print_coords(edge[0], edge[1])
+            print("Split error histogram:")
+            split_histogram = defaultdict(int)
+            for i in range(res["n_neurons"]):
+                split_histogram[len(splits_by_skel[i])] += 1
+            for k in sorted(split_histogram):
+                print(f'{k}: {split_histogram[k]}')
+            
             print("Merge errors:")
             for node1, node2 in merged_edges:
-                node1_coord = daisy.Coordinate(gt_graph.nodes[node1]['zyx_coord']) / 33
-                node2_coord = daisy.Coordinate(gt_graph.nodes[node2]['zyx_coord']) / 33
-                print(f"{node1_coord} to {node2_coord}")
+                print_coords(node1, node2)
 
         rand_voi = res['rand_voi']
         
         metrics = {'n_neurons': res["n_neurons"],
         'Expected run-length': res["erl"],
+        'Normalized ERL': res["erl_norm"],
         'Split count (total, per-neuron)': [len(split_edges), len(split_edges)/res["n_neurons"]],
         'Merge count (total, per-neuron)': [len(merged_edges), len(merged_edges)/res["n_neurons"]],
         'Rand split': rand_voi['rand_split'],
         'Rand merge': rand_voi['rand_merge'],
-        'VOI split': rand_voi['voi_split'],
-        'VOI merge': rand_voi['voi_merge'],
         'Normalized VOI split': rand_voi['nvi_split'],
-        'Normalized VOI merge': rand_voi['nvi_merge']}
+        'Normalized VOI merge': rand_voi['nvi_merge'],
+        'ERL+VOI': res['xpress_erl_voi'],
+        'ERL+RAND (XPRESS score)': res['xpress_erl_rand'],
+        'VOI': res['xpress_voi'],
+        'RAND': res['xpress_rand']}
 
         with open(self.output_file, "w") as f:
             f.write(json.dumps(metrics))
